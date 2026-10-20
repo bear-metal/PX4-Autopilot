@@ -213,7 +213,13 @@ public:
 
 	bool advertise() { return _pub.advertise(); }
 	void start() { ScheduleOnInterval(SOURCE_INTERVAL_US); }
-	void stop() { ScheduleClear(); }
+	// Cancel the timer, then wait out any Run() in flight.
+	void stop()
+	{
+		ScheduleClear();
+		Deinit();
+	}
+
 	uint8_t instance() { return _pub.get_instance(); }
 	uint32_t published() const { return _published.load(); }
 
@@ -254,13 +260,8 @@ public:
 
 	~Stage() override { _sub.unregisterCallback(); }
 
-	// Call only after stop(): the acquire on the run counter orders every write
-	// the work queue thread made in Run() before the caller's reads.
-	const LatencyStats &stats()
-	{
-		(void)_runs_done.load();
-		return _stats;
-	}
+	// Call only after stop().
+	const LatencyStats &stats() const { return _stats; }
 
 	bool start()
 	{
@@ -271,7 +272,12 @@ public:
 		return _sub.registerCallback();
 	}
 
-	void stop() { _sub.unregisterCallback(); }
+	// No new callbacks once unregistered; Deinit() then waits out any Run() in flight.
+	void stop()
+	{
+		_sub.unregisterCallback();
+		Deinit();
+	}
 
 	uint8_t out_instance() { return _pub.get_instance(); }
 	const char *name() const { return _name; }
@@ -298,8 +304,6 @@ private:
 				_pub.publish(out);
 			}
 		}
-
-		_runs_done.fetch_add(1);
 	}
 
 	const char *_name;
@@ -308,7 +312,6 @@ private:
 	uORB::PublicationMulti<Out> _pub;
 	IdlePolls _polls;
 	LatencyStats _stats;
-	px4::atomic<uint32_t> _runs_done{0};
 };
 
 class Poller : public px4::ScheduledWorkItem
@@ -329,14 +332,15 @@ public:
 		ScheduleOnInterval(POLLER_INTERVAL_US);
 	}
 
-	void stop() { ScheduleClear(); }
-
-	// Call only after stop(); see Stage::stats().
-	const LatencyStats &stats()
+	// Cancel the timer, then wait out any Run() in flight.
+	void stop()
 	{
-		(void)_runs_done.load();
-		return _stats;
+		ScheduleClear();
+		Deinit();
 	}
+
+	// Call only after stop().
+	const LatencyStats &stats() const { return _stats; }
 
 private:
 	void Run() override
@@ -346,13 +350,10 @@ private:
 		if (_sub.update(&msg) && g_recording.load()) {
 			_stats.add(msg.timestamp, msg.val);
 		}
-
-		_runs_done.fetch_add(1);
 	}
 
 	uORB::Subscription _sub;
 	LatencyStats _stats;
-	px4::atomic<uint32_t> _runs_done{0};
 };
 
 // Average cpuload.load over a window, or -1 when load_mon is not publishing.
@@ -473,15 +474,6 @@ int uORBTest::flight(unsigned seconds)
 		}
 
 		poller->stop();
-		px4_usleep(DRAIN_MS * 1000);
-
-		// stats() first: its acquire orders the work queue threads' writes (including the poll counters).
-		rate->stats();
-		control->stats();
-
-		for (auto *c : consumers) {
-			c->stats();
-		}
 
 		unsigned spurious = rate->spurious_polls() + control->spurious_polls();
 
