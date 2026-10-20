@@ -59,6 +59,7 @@
 #include <drivers/drv_hrt.h>
 #include <px4_platform_common/log.h>
 #include <px4_platform_common/posix.h>
+#include <px4_platform_common/px4_work_queue/WorkItem.hpp>
 
 #ifdef __PX4_NUTTX
 #include <malloc.h>
@@ -89,6 +90,15 @@ public:
 
 private:
 	unsigned _calls{0};
+};
+
+// Target for SubscriptionCallbackWorkItem: the bench measures the publish-side gate.
+class NopWorkItem : public px4::WorkItem
+{
+public:
+	NopWorkItem() : WorkItem("uorb_bench_nop", px4::wq_configurations::test1) {}
+
+	void Run() override {}
 };
 
 template <typename Op>
@@ -291,6 +301,63 @@ int uORBTest::bench(bool populate)
 		print(run("Subscription subscribe/unsubscribe", N_LOOKUP, [&] {
 			uORB::Subscription sub{ORB_ID(orb_test_large), static_cast<uint8_t>(last)};
 			sub.unsubscribe();
+		}));
+	}
+
+	// --- slow side of the interval, callback and poll gates ------------------
+	// After advertise and lookup, so their heap and timing windows stay as before.
+	{
+		uORB::SubscriptionInterval sub{ORB_ID(orb_test), 1000000};
+		sub.copy(&msg);
+		volatile bool sink = false;
+		print(run("publish + SubscriptionInterval::updated(), 1s", N_PUBLISH, [&] {
+			publish();
+			sink = sub.updated();
+		}));
+
+		print(run("publish + SubscriptionInterval::copy(), 1s", N_PUBLISH, [&] {
+			publish();
+			sub.copy(&msg);
+		}));
+	}
+
+	{
+		NopWorkItem items[4];
+		uORB::SubscriptionCallbackWorkItem cb[4] = {{&items[0], ORB_ID(orb_test)}, {&items[1], ORB_ID(orb_test)},
+			{&items[2], ORB_ID(orb_test)}, {&items[3], ORB_ID(orb_test)}
+		};
+
+		for (auto &c : cb) {
+			c.registerCallback();
+		}
+
+		print(run("publish, 4 work item callbacks, interval 0", N_PUBLISH, publish));
+
+		for (auto &c : cb) {
+			c.set_interval_us(1000000);
+		}
+
+		print(run("publish, 4 work item callbacks, interval 1s", N_PUBLISH, publish));
+
+		for (auto &c : cb) {
+			c.unregisterCallback();
+		}
+	}
+
+	{
+		// A topic keeps its poll waiter slots once allocated, so use a topic that no
+		// other case publishes.
+		uORB::Publication<orb_test_s> pub_polled{ORB_ID(orb_multitest)};
+		pub_polled.publish(msg);
+		const orb_sub_t sub = orb_subscribe(ORB_ID(orb_multitest));
+		px4_pollfd_struct_t fds[1] {};
+		fds[0].fd = sub;
+		fds[0].events = POLLIN;
+		px4_poll(fds, 1, 0);
+		orb_unsubscribe(sub);
+
+		print(run("publish, topic polled before", N_PUBLISH, [&] {
+			publish_failures += pub_polled.publish(msg) ? 0 : 1;
 		}));
 	}
 
